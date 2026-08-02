@@ -1,0 +1,10 @@
+.git
+.github
+tests
+docs
+.env
+.env.*
+README.md
+docker-compose*.yml
+__pycache__
+*.py[cod]

@@ -1,0 +1,36 @@
+services:
+  web-scan-move:
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/web-scan-move:${IMAGE_TAG:-latest}
+    container_name: web-scan-move
+    user: "${HELPER_UID:-10001}:${HELPER_GID:-10001}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    environment:
+      WATCH_DIR: /watch
+      DEST_DIR: /dest
+      QUARANTINE_DIR: /quarantine
+      DEFINITIONS_DIR: /var/lib/clamav
+      POLL_SECONDS: ${POLL_SECONDS:-5}
+      SETTLE_SECONDS: ${SETTLE_SECONDS:-30}
+      MAX_SCAN_WORKERS: ${MAX_SCAN_WORKERS:-1}
+      MAX_DEFINITION_AGE_SECONDS: ${MAX_DEFINITION_AGE_SECONDS:-172800}
+      SCAN_TIMEOUT_SECONDS: ${SCAN_TIMEOUT_SECONDS:-7200}
+      INCOMPLETE_SUFFIXES: ${INCOMPLETE_SUFFIXES:-.part,.tmp,.crdownload,.aria2,.partial,.download,.!qb}
+    volumes:
+      - ${WATCH_HOST_PATH:-/mnt/bulk/webdownloads/complete}:/watch:rw
+      - ${QUARANTINE_HOST_PATH:-/mnt/bulk/webdownloads/quarantine}:/quarantine:rw
+      - ${DEST_HOST_PATH:-/mnt/media/WebsiteDownloads}:/dest:rw
+      - ${DEFINITIONS_HOST_PATH:-/mnt/media/docker/clamav/defs}:/var/lib/clamav:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
