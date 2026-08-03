@@ -17,6 +17,10 @@ class ClamdError(RuntimeError):
     pass
 
 
+class ClamdPolicyError(ClamdError):
+    """ClamD could not produce a complete verdict because a safety limit was reached."""
+
+
 @dataclass(frozen=True)
 class FileIdentity:
     device: int
@@ -120,7 +124,7 @@ class ClamdClient:
                 raise ClamdError(f"refusing to scan a non-regular file: {path}")
             original = FileIdentity.from_stat(opened)
             if original.size > self.max_stream_bytes:
-                raise ClamdError(
+                raise ClamdPolicyError(
                     f"file exceeds configured stream limit: {original.size} > {self.max_stream_bytes}: {path}"
                 )
             self._verify_path_identity(path, original)
@@ -184,7 +188,7 @@ def parse_scan_response(response: str) -> ScanResult:
         "stream size limit exceeded",
     )
     if any(marker in lower for marker in limit_markers):
-        raise ClamdError(f"clamd scan limit was exceeded: {normalized[:500]}")
+        raise ClamdPolicyError(f"clamd scan limit was exceeded: {normalized[:500]}")
     if normalized.endswith(": OK"):
         return ScanResult(False, None, normalized)
     if normalized.endswith(" FOUND") and ": " in normalized:

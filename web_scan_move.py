@@ -14,7 +14,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from clamd_client import ClamdClient, ClamdError
+from clamd_client import ClamdClient, ClamdError, ClamdPolicyError
 from event_writer import EVENT_DIR, emit_event
 from safe_move import (
     Fingerprint,
@@ -245,6 +245,18 @@ class ItemProcessor:
             verify_mounts(mounts)
             if before != after:
                 raise RuntimeError("item changed while it was being scanned")
+        except ClamdPolicyError as exc:
+            log("scan_policy_limit", path=path, error=str(exc))
+            _emit_failure(
+                self._tracker,
+                "scan_failed",
+                "warning",
+                f"Content was held because ClamAV could not fully scan it: {exc}",
+                source_path=str(path),
+                action_success=False,
+                failure_kind="scan_policy_limit",
+            )
+            return
         except (OSError, RuntimeError, UnsafePathError, ClamdError) as exc:
             log("scan_failed", path=path, error=str(exc))
             _emit_failure(

@@ -14,9 +14,12 @@ The repository publishes two images:
 - `web-scan-move-clamd`: resident ClamD with read-only shared definitions, no
   content mount, and `network_mode: none`.
 
-They share only a Compose-managed Unix-socket volume. The socket is mode `0600`
-and both processes use the same numeric UID/GID. There is no TCP scanner listener,
-Docker socket, or FreshClam process. ClamD checks the shared read-only definition
+They share only the dedicated host directory configured by
+`WEB_CLAMD_SOCKET_HOST_DIR`. The socket is mode `0600`, the directory is mode
+`0750`, and both processes use the same numeric UID/GID. A bind mount avoids
+Docker initializing a named volume with the image's built-in UID when a different
+deployment UID is selected. There is no TCP scanner listener, Docker socket, or
+FreshClam process. ClamD checks the shared read-only definition
 directory every 300 seconds. It writes to container stderr, so Docker's configured
 log rotation covers daemon messages.
 
@@ -58,6 +61,7 @@ does not send Telegram directly.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `HELPER_UID`, `HELPER_GID` | `10001` | shared numeric identity for the app, sidecar, and writable host paths |
 | `POLL_SECONDS` | `5` | directory poll interval |
 | `SETTLE_SECONDS` | `30` | unchanged time before scan |
 | `MAX_SCAN_WORKERS` | `1` | simultaneous item scans (hard cap: 8) |
@@ -69,11 +73,30 @@ does not send Telegram directly.
 | `MAX_DEFINITION_AGE_SECONDS` | `172800` | ClamD freshness gate |
 | `INCOMPLETE_SUFFIXES` | browser/download suffix list | names that remain unsettled |
 | `*_MOUNT_MARKER` | empty | optional marker name relative to each root |
+| `WEB_CLAMD_SOCKET_HOST_DIR` | `/opt/docker/clamav-shared/sockets/web-scan-move` | private host socket directory shared only with the sidecar |
+
+A file above `MAX_STREAM_MIB`, or any ClamD limit response, is a distinct scan
+policy failure. The whole top-level item stays in `/watch`, a `scan_failed` event
+with `failure_kind=scan_policy_limit` is emitted, and nothing is promoted or
+quarantined as malware. Filename extensions never bypass this check.
 
 Internal paths are `/watch`, `/dest`, `/quarantine`, `/events`, `/state`, and
 `/run/clamav/clamd.sock`. See `.env.example` and
 `docker-compose.example.yml`. The example maps the requested host paths and
 stores events/state under `/opt/docker/clamav-shared`.
+
+Prepare the writable operational directories with the same identity configured
+by `HELPER_UID`/`HELPER_GID` (default `10001:10001`):
+
+```sh
+sudo install -d -m 0750 -o 10001 -g 10001 \
+  /opt/docker/clamav-shared/events/web-scan-move \
+  /opt/docker/clamav-shared/state/web-scan-move \
+  /opt/docker/clamav-shared/sockets/web-scan-move
+```
+
+The socket directory is runtime-only. Remove stale `clamd.sock` and `clamd.pid`
+files only while both web-scan-move containers are stopped.
 
 ```sh
 cp .env.example .env

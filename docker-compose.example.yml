@@ -33,7 +33,7 @@ services:
       - /mnt/media/WebsiteDownloads:/dest:rw
       - /opt/docker/clamav-shared/events/web-scan-move:/events:rw
       - /opt/docker/clamav-shared/state/web-scan-move:/state:rw
-      - web-clamav-socket:/run/clamav:rw
+      - ${WEB_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/web-scan-move}:/run/clamav:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     depends_on:
@@ -71,7 +71,7 @@ services:
       CLAMD_SOCKET: /run/clamav/clamd.sock
     volumes:
       - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
-      - web-clamav-socket:/run/clamav:rw
+      - ${WEB_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/web-scan-move}:/run/clamav:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
     cap_drop:
@@ -90,6 +90,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  web-clamav-socket:

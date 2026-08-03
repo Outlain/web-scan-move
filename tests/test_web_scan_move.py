@@ -33,6 +33,11 @@ class FakeClamd:
         return clamd_client.ScanResult(False, None, "stream: OK")
 
 
+class PolicyLimitClamd(FakeClamd):
+    def scan_file(self, path: Path) -> clamd_client.ScanResult:
+        raise clamd_client.ClamdPolicyError(f"scan limit exceeded: {path}")
+
+
 class SafeTreeTests(unittest.TestCase):
     def test_incomplete_suffix_is_case_insensitive(self) -> None:
         self.assertTrue(safe_move.has_incomplete_suffix(Path("file.PART"), (".part",)))
@@ -267,7 +272,7 @@ class ClamdProtocolTests(unittest.TestCase):
             thread.join(2)
 
     def test_limit_and_malformed_responses_are_failures(self) -> None:
-        with self.assertRaises(clamd_client.ClamdError):
+        with self.assertRaises(clamd_client.ClamdPolicyError):
             clamd_client.parse_scan_response("stream: Heuristics.Limits.Exceeded FOUND")
         with self.assertRaises(clamd_client.ClamdError):
             clamd_client.parse_scan_response("nonsense")
@@ -344,6 +349,26 @@ class ProcessorTests(unittest.TestCase):
                 for path in events.glob("*.json")
             }
             self.assertEqual(event_types, {"threat_detected", "infected_content_quarantined"})
+
+    def test_policy_limited_item_is_held_and_reported_as_scan_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            watch, destination, quarantine, events, _, service_patch, event_patch = self._configure(base)
+            source = watch / "movie.mkv"
+            source.write_bytes(b"oversized-media-placeholder")
+            with service_patch, event_patch:
+                processor = service.ItemProcessor(service.RecoveryTracker())
+                processor._clamd = PolicyLimitClamd()
+                self.assertTrue(processor.reserve(source))
+                processor.process(source)
+
+            self.assertTrue(source.exists())
+            self.assertFalse((destination / source.name).exists())
+            self.assertFalse((quarantine / source.name).exists())
+            event_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in events.glob("*.json")]
+            self.assertEqual(len(event_payloads), 1)
+            self.assertEqual(event_payloads[0]["event_type"], "scan_failed")
+            self.assertEqual(event_payloads[0]["failure_kind"], "scan_policy_limit")
 
 
 if __name__ == "__main__":

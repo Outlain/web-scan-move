@@ -23,6 +23,7 @@ def emit_event(
     destination_path: str | None = None,
     threat_name: str | None = None,
     action_success: bool | None = None,
+    failure_kind: str | None = None,
 ) -> str:
     """Atomically spool one event and return its globally unique identifier."""
     event_id = str(uuid.uuid4())
@@ -40,6 +41,7 @@ def emit_event(
         "destination_path": destination_path,
         "threat_name": threat_name,
         "action_success": action_success,
+        "failure_kind": failure_kind,
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
 
