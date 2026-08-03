@@ -6,22 +6,72 @@ services:
     init: true
     restart: unless-stopped
     read_only: true
+    network_mode: none
     environment:
       WATCH_DIR: /watch
       DEST_DIR: /dest
       QUARANTINE_DIR: /quarantine
-      DEFINITIONS_DIR: /var/lib/clamav
+      EVENT_DIR: /events
+      STATE_DIR: /state
+      CLAMD_SOCKET: /run/clamav/clamd.sock
       POLL_SECONDS: ${POLL_SECONDS:-5}
       SETTLE_SECONDS: ${SETTLE_SECONDS:-30}
       MAX_SCAN_WORKERS: ${MAX_SCAN_WORKERS:-1}
+      DISCOVERY_WORKERS: ${DISCOVERY_WORKERS:-4}
+      DISCOVERY_QUEUE: ${DISCOVERY_QUEUE:-64}
       MAX_DEFINITION_AGE_SECONDS: ${MAX_DEFINITION_AGE_SECONDS:-172800}
+      CLAMD_CONNECT_TIMEOUT_SECONDS: ${CLAMD_CONNECT_TIMEOUT_SECONDS:-5}
       SCAN_TIMEOUT_SECONDS: ${SCAN_TIMEOUT_SECONDS:-7200}
+      MAX_STREAM_MIB: ${MAX_STREAM_MIB:-2000}
       INCOMPLETE_SUFFIXES: ${INCOMPLETE_SUFFIXES:-.part,.tmp,.crdownload,.aria2,.partial,.download,.!qb}
+      WATCH_MOUNT_MARKER: ${WATCH_MOUNT_MARKER:-}
+      DEST_MOUNT_MARKER: ${DEST_MOUNT_MARKER:-}
+      QUARANTINE_MOUNT_MARKER: ${QUARANTINE_MOUNT_MARKER:-}
     volumes:
-      - ${WATCH_HOST_PATH:-/mnt/bulk/webdownloads/complete}:/watch:rw
-      - ${QUARANTINE_HOST_PATH:-/mnt/bulk/webdownloads/quarantine}:/quarantine:rw
-      - ${DEST_HOST_PATH:-/mnt/media/WebsiteDownloads}:/dest:rw
-      - ${DEFINITIONS_HOST_PATH:-/mnt/media/docker/clamav/defs}:/var/lib/clamav:ro
+      - /mnt/bulk/webdownloads/complete:/watch:rw
+      - /mnt/bulk/webdownloads/quarantine:/quarantine:rw
+      - /mnt/media/WebsiteDownloads:/dest:rw
+      - /opt/docker/clamav-shared/events/web-scan-move:/events:rw
+      - /opt/docker/clamav-shared/state/web-scan-move:/state:rw
+      - web-clamav-socket:/run/clamav:rw
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+    depends_on:
+      web-scan-move-clamd:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web-scan-move-clamd:
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/web-scan-move-clamd:${IMAGE_TAG:-latest}
+    container_name: web-scan-move-clamd
+    user: "${HELPER_UID:-10001}:${HELPER_GID:-10001}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    network_mode: none
+    environment:
+      DEFINITIONS_DIR: /var/lib/clamav
+      DEFINITIONS_WAIT_TIMEOUT: "1800"
+      DEFINITIONS_MAX_AGE_SECONDS: ${MAX_DEFINITION_AGE_SECONDS:-172800}
+      CLAMD_SOCKET: /run/clamav/clamd.sock
+    volumes:
+      - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
+      - web-clamav-socket:/run/clamav:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
     cap_drop:
@@ -29,8 +79,17 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
+    mem_limit: 4g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  web-clamav-socket:

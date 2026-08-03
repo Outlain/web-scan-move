@@ -1,0 +1,30 @@
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+ARG CLAMAV_PACKAGE_VERSION=1.4.5-r0
+
+RUN apk upgrade --no-cache \
+    && apk add --no-cache "clamav=${CLAMAV_PACKAGE_VERSION}" "clamav-daemon=${CLAMAV_PACKAGE_VERSION}" python3 \
+    && clamd --version | grep -Eq '^ClamAV 1\.4\.5($|/)' \
+    && addgroup -S -g 10001 web-scan-move \
+    && adduser -S -D -u 10001 -G web-scan-move -h /home/web-scan-move web-scan-move \
+    && install -d -o 10001 -g 10001 -m 0750 /home/web-scan-move /run/clamav /tmp/clamav
+
+COPY clamav/clamd.conf /etc/clamav/clamd.conf
+COPY clamav/clamd_entrypoint.py clamav/clamd_healthcheck.py /usr/local/bin/
+RUN chmod 0444 /etc/clamav/clamd.conf \
+    && chmod 0555 /usr/local/bin/clamd_entrypoint.py /usr/local/bin/clamd_healthcheck.py
+
+ENV DEFINITIONS_DIR=/var/lib/clamav \
+    DEFINITIONS_WAIT_TIMEOUT=1800 \
+    DEFINITIONS_MAX_AGE_SECONDS=172800 \
+    CLAMD_SOCKET=/run/clamav/clamd.sock \
+    HOME=/home/web-scan-move \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+USER 10001:10001
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 \
+    CMD ["python3", "/usr/local/bin/clamd_healthcheck.py"]
+
+CMD ["python3", "/usr/local/bin/clamd_entrypoint.py"]

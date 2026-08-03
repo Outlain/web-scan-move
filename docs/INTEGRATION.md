@@ -1,15 +1,24 @@
 # Integration
 
-The expected host workflow is an incomplete-to-complete download layout:
+Deploy `clamav-defs-updater` first. `web-scan-move-clamd` mounts
+`/opt/docker/clamav-shared/defs:/var/lib/clamav:ro`, waits for complete fresh
+definitions, then creates a mode-`0600` socket in the named
+`web-clamav-socket` volume. Compose starts the application after the sidecar is
+healthy.
 
-```text
-/mnt/bulk/webdownloads/incomplete
-/mnt/bulk/webdownloads/complete
-/mnt/bulk/webdownloads/quarantine
+The application writes schema-v1 files to
+`/opt/docker/clamav-shared/events/web-scan-move`. `clamav-notifier` mounts the
+parent event directory and owns all Telegram delivery. No human log is used as
+an event queue.
+
+The host watch, quarantine, and destination mounts intentionally remain:
+
+```yaml
+- /mnt/bulk/webdownloads/complete:/watch:rw
+- /mnt/bulk/webdownloads/quarantine:/quarantine:rw
+- /mnt/media/WebsiteDownloads:/dest:rw
 ```
 
-Only the `complete` directory should be mounted at `/watch`. Your downloader should finish content elsewhere and then rename or move the completed top-level item into `complete`.
-
-The scanner mounts the shared FreshClam database read-only and starts a new `clamscan` for each settled item. Each new process loads the currently available definitions.
-
-Clean content is moved to `/mnt/media/WebsiteDownloads`; infected content is moved to the dedicated web-download quarantine directory.
+Optional marker names can detect a mount that has fallen back to an empty local
+directory. Place the configured marker inside its corresponding host root before
+enabling it.
