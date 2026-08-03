@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from clamd_client import ClamdClient, ClamdError, ClamdPolicyError
+from content_scanner import ContentScanner
 from event_writer import EVENT_DIR, emit_event
 from safe_move import (
     Fingerprint,
@@ -45,6 +46,39 @@ CLAMD_CONNECT_TIMEOUT_SECONDS = max(float(os.environ.get("CLAMD_CONNECT_TIMEOUT_
 SCAN_TIMEOUT_SECONDS = max(int(os.environ.get("SCAN_TIMEOUT_SECONDS", "7200")), 60)
 MAX_STREAM_BYTES = min(max(int(os.environ.get("MAX_STREAM_MIB", "2000")), 1), 2000) * 1024 * 1024
 MAX_DEFINITION_AGE_SECONDS = max(int(os.environ.get("MAX_DEFINITION_AGE_SECONDS", "172800")), 300)
+
+
+def _env_bool(name: str, default: str) -> bool:
+    value = os.environ.get(name, default).strip().casefold()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false")
+
+
+LARGE_MEDIA_ENABLED = _env_bool("LARGE_MEDIA_ENABLED", "true")
+LARGE_MEDIA_MAX_BYTES = max(int(os.environ.get("LARGE_MEDIA_MAX_FILE_GIB", "100")), 1) * 1024**3
+LARGE_MEDIA_WINDOW_BYTES = max(int(os.environ.get("LARGE_MEDIA_CHUNK_MIB", "1024")), 1) * 1024**2
+LARGE_MEDIA_OVERLAP_BYTES = max(int(os.environ.get("LARGE_MEDIA_OVERLAP_KIB", "1024")), 0) * 1024
+LARGE_MEDIA_PROBE_TIMEOUT_SECONDS = max(
+    int(os.environ.get("LARGE_MEDIA_PROBE_TIMEOUT_SECONDS", "120")), 1
+)
+LARGE_MEDIA_SCAN_TIMEOUT_SECONDS = max(
+    int(os.environ.get("LARGE_MEDIA_SCAN_TIMEOUT_SECONDS", "21600")), 60
+)
+FFPROBE_BINARY = os.environ.get("FFPROBE_BINARY", "/usr/bin/ffprobe")
+ARCHIVE_SCAN_ENABLED = _env_bool("ARCHIVE_SCAN_ENABLED", "true")
+ARCHIVE_MAX_SOURCE_BYTES = max(int(os.environ.get("ARCHIVE_MAX_SOURCE_GIB", "100")), 1) * 1024**3
+ARCHIVE_MAX_TOTAL_BYTES = max(int(os.environ.get("ARCHIVE_MAX_TOTAL_GIB", "50")), 1) * 1024**3
+ARCHIVE_MAX_ENTRIES = min(max(int(os.environ.get("ARCHIVE_MAX_ENTRIES", "10000")), 1), 100000)
+ARCHIVE_MAX_COMPRESSION_RATIO = min(
+    max(int(os.environ.get("ARCHIVE_MAX_COMPRESSION_RATIO", "200")), 1),
+    10000,
+)
+ARCHIVE_SCAN_TIMEOUT_SECONDS = max(
+    int(os.environ.get("ARCHIVE_SCAN_TIMEOUT_SECONDS", "21600")), 60
+)
 WATCH_MOUNT_MARKER = os.environ.get("WATCH_MOUNT_MARKER", "").strip()
 DEST_MOUNT_MARKER = os.environ.get("DEST_MOUNT_MARKER", "").strip()
 QUARANTINE_MOUNT_MARKER = os.environ.get("QUARANTINE_MOUNT_MARKER", "").strip()
@@ -57,6 +91,19 @@ TEMP_SUFFIXES = tuple(
     ).split(",")
     if suffix.strip()
 )
+
+
+def validate_content_policy() -> None:
+    if LARGE_MEDIA_WINDOW_BYTES > MAX_STREAM_BYTES:
+        raise RuntimeError("LARGE_MEDIA_CHUNK_MIB must not exceed MAX_STREAM_MIB")
+    if LARGE_MEDIA_OVERLAP_BYTES >= LARGE_MEDIA_WINDOW_BYTES:
+        raise RuntimeError("LARGE_MEDIA_OVERLAP_KIB must be smaller than LARGE_MEDIA_CHUNK_MIB")
+    if ARCHIVE_MAX_TOTAL_BYTES <= 0 or ARCHIVE_MAX_SOURCE_BYTES <= 0:
+        raise RuntimeError("archive byte limits must be positive")
+    if LARGE_MEDIA_ENABLED and (
+        not os.path.isabs(FFPROBE_BINARY) or not os.access(FFPROBE_BINARY, os.X_OK)
+    ):
+        raise RuntimeError(f"large-media ffprobe executable is unavailable: {FFPROBE_BINARY}")
 
 
 @dataclass(frozen=True)
@@ -234,9 +281,27 @@ class ItemProcessor:
         )
         infected_path: Path | None = None
         threat_name: str | None = None
+        scan_methods: set[str] = set()
+        content_scanner = ContentScanner(
+            self._clamd,
+            large_media_enabled=LARGE_MEDIA_ENABLED,
+            large_media_max_bytes=LARGE_MEDIA_MAX_BYTES,
+            large_media_window_bytes=LARGE_MEDIA_WINDOW_BYTES,
+            large_media_overlap_bytes=LARGE_MEDIA_OVERLAP_BYTES,
+            large_media_probe_timeout_seconds=LARGE_MEDIA_PROBE_TIMEOUT_SECONDS,
+            large_media_scan_timeout_seconds=LARGE_MEDIA_SCAN_TIMEOUT_SECONDS,
+            ffprobe_binary=FFPROBE_BINARY,
+            archive_scan_enabled=ARCHIVE_SCAN_ENABLED,
+            archive_max_source_bytes=ARCHIVE_MAX_SOURCE_BYTES,
+            archive_max_total_bytes=ARCHIVE_MAX_TOTAL_BYTES,
+            archive_max_entries=ARCHIVE_MAX_ENTRIES,
+            archive_max_compression_ratio=ARCHIVE_MAX_COMPRESSION_RATIO,
+            archive_scan_timeout_seconds=ARCHIVE_SCAN_TIMEOUT_SECONDS,
+        )
         try:
             for file_path in regular_files(path, incomplete_suffixes=TEMP_SUFFIXES):
-                result = self._clamd.scan_file(file_path)
+                result = content_scanner.scan_file(file_path)
+                scan_methods.add(result.scan_method)
                 if result.infected:
                     infected_path = file_path
                     threat_name = result.threat_name
@@ -339,6 +404,7 @@ class ItemProcessor:
             path=path,
             destination=destination,
             verdict="infected" if infected else "clean",
+            scan_methods=sorted(scan_methods),
         )
         try:
             self._tracker.recovered("Web-download scanning and movement recovered")
@@ -357,6 +423,7 @@ def list_top_level_items() -> list[Path]:
 
 def healthcheck() -> int:
     try:
+        validate_content_policy()
         capture_mounts()
         PathIdentity.capture(STATE_DIR)
         PathIdentity.capture(EVENT_DIR)
@@ -382,6 +449,12 @@ def healthcheck() -> int:
 def main() -> int:
     if "--healthcheck" in sys.argv:
         return healthcheck()
+
+    try:
+        validate_content_policy()
+    except RuntimeError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
 
     stop = threading.Event()
     for signal_number in (signal.SIGTERM, signal.SIGINT):

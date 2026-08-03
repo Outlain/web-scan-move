@@ -7,6 +7,7 @@ import os
 import socket
 import stat
 import struct
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -39,6 +40,7 @@ class ScanResult:
     infected: bool
     threat_name: str | None
     response: str
+    scan_method: str = "clamd_native"
 
 
 @dataclass(frozen=True)
@@ -76,9 +78,26 @@ class ClamdClient:
         return client
 
     @staticmethod
-    def _receive_nul(client: socket.socket, *, maximum: int = 1024 * 1024) -> str:
+    def _apply_deadline(client: socket.socket, deadline: float | None) -> None:
+        if deadline is None:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ClamdPolicyError("scan exceeded its total time limit")
+        configured = client.gettimeout()
+        client.settimeout(max(min(configured or remaining, remaining), 0.001))
+
+    @classmethod
+    def _receive_nul(
+        cls,
+        client: socket.socket,
+        *,
+        maximum: int = 1024 * 1024,
+        deadline: float | None = None,
+    ) -> str:
         response = bytearray()
         while len(response) <= maximum:
+            cls._apply_deadline(client, deadline)
             chunk = client.recv(min(65536, maximum + 1 - len(response)))
             if not chunk:
                 raise ClamdError("clamd closed the connection without a complete reply")
@@ -151,6 +170,94 @@ class ClamdClient:
                 return self._receive_nul(client)
         except (OSError, TimeoutError) as exc:
             raise ClamdError(f"clamd stream failed: {exc}") from exc
+
+    def scan_descriptor_range(
+        self,
+        descriptor: int,
+        offset: int,
+        length: int,
+        *,
+        deadline: float | None = None,
+    ) -> ScanResult:
+        if offset < 0 or length < 0 or length > self.max_stream_bytes:
+            raise ClamdPolicyError(
+                f"invalid ClamD range offset={offset} length={length} max={self.max_stream_bytes}"
+            )
+        try:
+            with self._connect(self.connect_timeout) as client:
+                client.settimeout(self.scan_timeout)
+                self._apply_deadline(client, deadline)
+                client.sendall(b"zINSTREAM\0")
+                current_offset = offset
+                remaining = length
+                while remaining:
+                    self._apply_deadline(client, deadline)
+                    chunk = os.pread(descriptor, min(1024 * 1024, remaining), current_offset)
+                    if not chunk:
+                        raise ClamdError("source became shorter during ranged scan")
+                    client.sendall(struct.pack("!I", len(chunk)))
+                    client.sendall(chunk)
+                    current_offset += len(chunk)
+                    remaining -= len(chunk)
+                client.sendall(struct.pack("!I", 0))
+                response = self._receive_nul(client, deadline=deadline)
+        except ClamdError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            raise ClamdError(f"clamd ranged stream failed: {exc}") from exc
+        parsed = parse_scan_response(response)
+        return ScanResult(
+            parsed.infected,
+            parsed.threat_name,
+            parsed.response,
+            "large_media_full_byte_windows",
+        )
+
+    def scan_reader(
+        self,
+        reader,
+        *,
+        maximum_bytes: int,
+        deadline: float,
+    ) -> tuple[ScanResult, int]:
+        if maximum_bytes < 0 or maximum_bytes > self.max_stream_bytes:
+            raise ClamdPolicyError(
+                f"archive entry limit {maximum_bytes} exceeds ClamD stream limit {self.max_stream_bytes}"
+            )
+        total = 0
+        try:
+            with self._connect(self.connect_timeout) as client:
+                client.settimeout(self.scan_timeout)
+                self._apply_deadline(client, deadline)
+                client.sendall(b"zINSTREAM\0")
+                while True:
+                    self._apply_deadline(client, deadline)
+                    chunk = reader.read(min(1024 * 1024, maximum_bytes - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > maximum_bytes:
+                        raise ClamdPolicyError(
+                            f"archive entry expanded beyond its {maximum_bytes}-byte limit"
+                        )
+                    client.sendall(struct.pack("!I", len(chunk)))
+                    client.sendall(chunk)
+                client.sendall(struct.pack("!I", 0))
+                response = self._receive_nul(client, deadline=deadline)
+        except ClamdError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            raise ClamdError(f"clamd archive-entry stream failed: {exc}") from exc
+        parsed = parse_scan_response(response)
+        return (
+            ScanResult(
+                parsed.infected,
+                parsed.threat_name,
+                parsed.response,
+                "bounded_zip_entries",
+            ),
+            total,
+        )
 
     @staticmethod
     def _verify_path_identity(path: Path, expected: FileIdentity) -> None:

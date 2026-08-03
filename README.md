@@ -51,6 +51,25 @@ The service:
   proves that the completed destination belongs to that move;
 - leaves scan and promotion failures in `/watch` for retry.
 
+Files at or below `MAX_STREAM_MIB` keep the normal native ClamD path. Larger
+files are never skipped. Genuine video containers are verified by `ffprobe`,
+must contain a video stream, and are read completely through overlapping ClamD
+windows. The result is labeled `large_media_full_byte_windows` because it is not
+equivalent to one native whole-file ClamAV parser invocation.
+
+ZIP is the one archive format with a dedicated policy here because `/watch` is
+the deliberate/manual web-download boundary. Every detected ZIP, small or
+large, uses this route. It is not unpacked onto disk. Each regular entry is
+decompressed directly into ClamD and discarded, with hard
+limits on source size, total actual expanded bytes, entry count, per-entry size,
+compression ratio, central-directory metadata (fixed at 64 MiB), and elapsed
+time. Encrypted entries, symlinks, special files,
+nested archives, unsupported compression, CRC/parser failures, and any reached
+limit leave the original ZIP untouched in `/watch`. This avoids needing a large
+scratch mount and prevents a ZIP bomb from filling local storage. RAR, 7z, ISO,
+disk images, unknown oversized content, and oversized individual ZIP entries are
+held rather than guessed clean.
+
 Detections are durably spooled before quarantine. Events include
 `threat_detected`, `infected_content_quarantined`, `quarantine_failed`,
 `scan_failed`, `promotion_failed`, `mount_unavailable`, and
@@ -69,16 +88,29 @@ does not send Telegram directly.
 | `DISCOVERY_QUEUE` | `64` | maximum queued fingerprint tasks (hard cap: 4096) |
 | `CLAMD_CONNECT_TIMEOUT_SECONDS` | `5` | socket connect timeout |
 | `SCAN_TIMEOUT_SECONDS` | `7200` | per-file socket reply timeout |
-| `MAX_STREAM_MIB` | `2000` | fail-closed per-file stream bound (hard cap: 2000 MiB) |
+| `MAX_STREAM_MIB` | `2000` | native ClamD routing boundary (hard cap: 2000 MiB) |
+| `LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video routing |
+| `LARGE_MEDIA_MAX_FILE_GIB` | `100` | maximum individual video handled by the large-media route |
+| `LARGE_MEDIA_CHUNK_MIB` | `1024` | independent ClamD window size |
+| `LARGE_MEDIA_OVERLAP_KIB` | `1024` | repeated bytes across neighboring windows |
+| `LARGE_MEDIA_PROBE_TIMEOUT_SECONDS` | `120` | ffprobe validation deadline |
+| `LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `21600` | whole large-video deadline |
+| `ARCHIVE_SCAN_ENABLED` | `true` | enable bounded ZIP entry streaming |
+| `ARCHIVE_MAX_SOURCE_GIB` | `100` | maximum ZIP file size |
+| `ARCHIVE_MAX_TOTAL_GIB` | `50` | maximum actual decompressed bytes across entries |
+| `ARCHIVE_MAX_ENTRIES` | `10000` | maximum ZIP entry count |
+| `ARCHIVE_MAX_COMPRESSION_RATIO` | `200` | per-entry bomb protection |
+| `ARCHIVE_SCAN_TIMEOUT_SECONDS` | `21600` | whole bounded ZIP deadline |
 | `MAX_DEFINITION_AGE_SECONDS` | `172800` | ClamD freshness gate |
 | `INCOMPLETE_SUFFIXES` | browser/download suffix list | names that remain unsettled |
 | `*_MOUNT_MARKER` | empty | optional marker name relative to each root |
 | `WEB_CLAMD_SOCKET_HOST_DIR` | `/opt/docker/clamav-shared/sockets/web-scan-move` | private host socket directory shared only with the sidecar |
 
-A file above `MAX_STREAM_MIB`, or any ClamD limit response, is a distinct scan
-policy failure. The whole top-level item stays in `/watch`, a `scan_failed` event
-with `failure_kind=scan_policy_limit` is emitted, and nothing is promoted or
-quarantined as malware. Filename extensions never bypass this check.
+A file that cannot complete its applicable native, large-media, or bounded-ZIP
+policy is a distinct scan-policy failure. The whole top-level item stays in
+`/watch`, a `scan_failed` event with `failure_kind=scan_policy_limit` is emitted,
+and nothing is promoted or quarantined as malware. Filename extensions never
+bypass content validation.
 
 Internal paths are `/watch`, `/dest`, `/quarantine`, `/events`, `/state`, and
 `/run/clamav/clamd.sock`. See `.env.example` and
@@ -113,14 +145,15 @@ limit for archive extraction and database reload.
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m py_compile web_scan_move.py clamd_client.py event_writer.py safe_move.py clamav/*.py
+python3 -m py_compile web_scan_move.py clamd_client.py content_scanner.py event_writer.py safe_move.py clamav/*.py
 docker compose -f docker-compose.example.yml config --quiet
 docker build -t web-scan-move:test .
 docker build -f Dockerfile.clamd -t web-scan-move-clamd:test .
 ```
 
 Tests cover clean promotion, EICAR threat parsing, definition freshness, malformed
-and limit responses, newline names, file replacement, symlink/special rejection,
-quarantine collisions, infected folders, target races, durable events, and
-cross-filesystem crash recovery. GitHub Actions publishes both images for
-`linux/amd64` and `linux/arm64`.
+and limit responses, overlapping large-media byte coverage, bounded ZIP entry
+streaming, ZIP-bomb and nested-archive rejection, newline names, file replacement,
+symlink/special rejection, quarantine collisions, infected folders, target
+races, durable events, and cross-filesystem crash recovery. GitHub Actions
+publishes both images for `linux/amd64` and `linux/arm64`.

@@ -9,12 +9,14 @@ import struct
 import tempfile
 import threading
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import clamd_client
+import content_scanner
 import event_writer
 import safe_move
 import web_scan_move as service
@@ -23,6 +25,7 @@ import web_scan_move as service
 class FakeClamd:
     def __init__(self, infected_name: str | None = None) -> None:
         self.infected_name = infected_name
+        self.max_stream_bytes = 1024 * 1024
 
     def health(self) -> SimpleNamespace:
         return SimpleNamespace(raw_version="ClamAV test/1/current")
@@ -36,6 +39,67 @@ class FakeClamd:
 class PolicyLimitClamd(FakeClamd):
     def scan_file(self, path: Path) -> clamd_client.ScanResult:
         raise clamd_client.ClamdPolicyError(f"scan limit exceeded: {path}")
+
+
+class StreamingFakeClamd(FakeClamd):
+    def __init__(self, max_stream_bytes: int = 32) -> None:
+        super().__init__()
+        self.max_stream_bytes = max_stream_bytes
+        self.ranges: list[bytes] = []
+        self.entries: list[bytes] = []
+
+    def scan_descriptor_range(
+        self,
+        descriptor: int,
+        offset: int,
+        length: int,
+        *,
+        deadline: float | None = None,
+    ) -> clamd_client.ScanResult:
+        content = os.pread(descriptor, length, offset)
+        self.ranges.append(content)
+        infected = b"EICAR" in content
+        return clamd_client.ScanResult(
+            infected,
+            "Test.Eicar" if infected else None,
+            "stream: Test.Eicar FOUND" if infected else "stream: OK",
+            "large_media_full_byte_windows",
+        )
+
+    def scan_reader(self, reader, *, maximum_bytes: int, deadline: float):
+        content = reader.read(maximum_bytes + 1)
+        if len(content) > maximum_bytes:
+            raise clamd_client.ClamdPolicyError("entry exceeded maximum")
+        self.entries.append(content)
+        infected = b"EICAR" in content
+        return (
+            clamd_client.ScanResult(
+                infected,
+                "Test.Eicar" if infected else None,
+                "stream: Test.Eicar FOUND" if infected else "stream: OK",
+                "bounded_zip_entries",
+            ),
+            len(content),
+        )
+
+
+def make_content_scanner(fake: FakeClamd) -> content_scanner.ContentScanner:
+    return content_scanner.ContentScanner(
+        fake,
+        large_media_enabled=True,
+        large_media_max_bytes=1024 * 1024,
+        large_media_window_bytes=min(fake.max_stream_bytes, 16),
+        large_media_overlap_bytes=min(fake.max_stream_bytes, 16) // 4,
+        large_media_probe_timeout_seconds=5,
+        large_media_scan_timeout_seconds=60,
+        ffprobe_binary="/unused/ffprobe",
+        archive_scan_enabled=True,
+        archive_max_source_bytes=1024 * 1024,
+        archive_max_total_bytes=1024 * 1024,
+        archive_max_entries=100,
+        archive_max_compression_ratio=20,
+        archive_scan_timeout_seconds=60,
+    )
 
 
 class SafeTreeTests(unittest.TestCase):
@@ -170,6 +234,7 @@ class HealthTests(unittest.TestCase):
         with (
             patch.object(service, "capture_mounts"),
             patch.object(service.PathIdentity, "capture", return_value=identity),
+            patch.object(service, "LARGE_MEDIA_ENABLED", False),
             patch.object(service.os, "access", return_value=False),
         ):
             self.assertEqual(service.healthcheck(), 1)
@@ -283,6 +348,122 @@ class ClamdProtocolTests(unittest.TestCase):
         with patch.object(client, "command", side_effect=["PONG", f"ClamAV 1.4.5/123/{old}"]):
             with self.assertRaisesRegex(clamd_client.ClamdError, "stale"):
                 client.health()
+
+
+class LargeContentPolicyTests(unittest.TestCase):
+    def test_large_media_windows_cover_all_bytes_and_overlap(self) -> None:
+        ranges = content_scanner.window_ranges(25, 10, 2)
+        self.assertEqual(ranges, [(0, 10), (8, 10), (16, 9)])
+        covered = [False] * 25
+        for offset, length in ranges:
+            for index in range(offset, offset + length):
+                covered[index] = True
+        self.assertTrue(all(covered))
+
+    def test_oversized_video_uses_full_byte_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "movie.mkv"
+            path.write_bytes(b"0123456789abcdefghijklmnop")
+            fake = StreamingFakeClamd(max_stream_bytes=10)
+            scanner = make_content_scanner(fake)
+            scanner.large_media_window_bytes = 10
+            scanner.large_media_overlap_bytes = 2
+            with patch.object(scanner, "_probe", return_value="matroska,webm"):
+                result = scanner.scan_file(path)
+
+            self.assertFalse(result.infected)
+            self.assertEqual(result.scan_method, "large_media_full_byte_windows")
+            self.assertEqual(fake.ranges, [b"0123456789", b"89abcdefgh", b"ghijklmnop"])
+            covered = bytearray(len(path.read_bytes()))
+            for offset, length in content_scanner.window_ranges(len(covered), 10, 2):
+                covered[offset : offset + length] = b"\x01" * length
+            self.assertTrue(all(covered))
+
+    def test_bounded_zip_is_streamed_entry_by_entry_without_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "bundle.zip"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("first.txt", b"safe")
+                archive.writestr("second.bin", b"also safe")
+            fake = StreamingFakeClamd(max_stream_bytes=32)
+            scanner = make_content_scanner(fake)
+            result = scanner.scan_file(path)
+
+            self.assertFalse(result.infected)
+            self.assertEqual(result.scan_method, "bounded_zip_entries")
+            self.assertEqual(fake.entries, [b"safe", b"also safe"])
+            self.assertEqual({item.name for item in root.iterdir()}, {"bundle.zip"})
+
+    def test_small_zip_always_uses_bounded_entry_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "small.zip"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("payload.txt", b"safe")
+            fake = StreamingFakeClamd(max_stream_bytes=1024 * 1024)
+
+            result = make_content_scanner(fake).scan_file(path)
+
+            self.assertEqual(result.scan_method, "bounded_zip_entries")
+            self.assertEqual(fake.entries, [b"safe"])
+
+    def test_infected_zip_entry_is_reported_infected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bundle.zip"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("malware.bin", b"EICAR test bytes")
+            fake = StreamingFakeClamd(max_stream_bytes=32)
+            result = make_content_scanner(fake).scan_file(path)
+
+            self.assertTrue(result.infected)
+            self.assertEqual(result.threat_name, "Test.Eicar")
+            self.assertIn("malware.bin", result.response)
+
+    def test_zip_bomb_ratio_and_nested_archive_are_held(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bomb = root / "bomb.zip"
+            with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("zeros.txt", b"0" * 10000)
+                archive.comment = b"padding" * 3000
+            scanner = make_content_scanner(StreamingFakeClamd(max_stream_bytes=20000))
+            with self.assertRaisesRegex(clamd_client.ClamdPolicyError, "compression ratio"):
+                scanner.scan_file(bomb)
+
+            nested = root / "nested.zip"
+            with zipfile.ZipFile(nested, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("inside.zip", b"PK\x03\x04nested")
+            scanner = make_content_scanner(StreamingFakeClamd(max_stream_bytes=32))
+            with self.assertRaisesRegex(clamd_client.ClamdPolicyError, "nested archive"):
+                scanner.scan_file(nested)
+
+    def test_zip_entry_count_is_rejected_before_zipfile_allocates_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "too-many.zip"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("one.txt", b"safe")
+            payload = bytearray(path.read_bytes())
+            eocd = payload.rfind(b"PK\x05\x06")
+            self.assertGreaterEqual(eocd, 0)
+            struct.pack_into("<HH", payload, eocd + 8, 101, 101)
+            path.write_bytes(payload)
+            scanner = make_content_scanner(StreamingFakeClamd(max_stream_bytes=1024))
+            scanner.archive_max_entries = 100
+
+            with self.assertRaisesRegex(clamd_client.ClamdPolicyError, "101 entries"):
+                scanner.scan_file(path)
+
+    def test_media_probe_rejects_renamed_archive(self) -> None:
+        with self.assertRaisesRegex(clamd_client.ClamdPolicyError, "not an approved video"):
+            content_scanner.parse_media_probe(
+                json.dumps(
+                    {
+                        "format": {"format_name": "zip"},
+                        "streams": [{"codec_type": "video"}],
+                    }
+                ),
+                Path("renamed.mkv"),
+            )
 
 
 class ProcessorTests(unittest.TestCase):

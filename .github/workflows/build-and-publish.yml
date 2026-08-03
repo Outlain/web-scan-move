@@ -20,7 +20,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Check Python syntax
-        run: python3 -m py_compile web_scan_move.py clamd_client.py event_writer.py safe_move.py clamav/*.py
+        run: python3 -m py_compile web_scan_move.py clamd_client.py content_scanner.py event_writer.py safe_move.py clamav/*.py
 
       - name: Validate Compose example
         run: docker compose -f docker-compose.example.yml config --quiet
@@ -38,10 +38,11 @@ jobs:
         run: |
           test "$(docker image inspect web-scan-move:test --format '{{.Config.User}}')" = "10001:10001"
           test "$(docker image inspect web-scan-move-clamd:test --format '{{.Config.User}}')" = "10001:10001"
+          docker run --rm --entrypoint ffprobe web-scan-move:test -version
 
       - name: Verify read-only-root compatibility
         run: |
-          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python3 web-scan-move:test -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("/usr/local/bin/web_scan_move.py", "/usr/local/bin/clamd_client.py", "/usr/local/bin/event_writer.py", "/usr/local/bin/safe_move.py")]'
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python3 web-scan-move:test -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("/usr/local/bin/web_scan_move.py", "/usr/local/bin/clamd_client.py", "/usr/local/bin/content_scanner.py", "/usr/local/bin/event_writer.py", "/usr/local/bin/safe_move.py")]'
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python3 web-scan-move-clamd:test -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("/usr/local/bin/clamd_entrypoint.py", "/usr/local/bin/clamd_healthcheck.py")]'
 
       - name: Set up QEMU
