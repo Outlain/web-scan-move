@@ -41,8 +41,9 @@ The service:
 - re-fingerprints the complete item and verifies watch/destination/quarantine
   mount identities and optional marker identities before moving;
 - sends infected folders to quarantine, not the clean destination;
-- uses Linux `renameat2(RENAME_NOREPLACE)` and chooses a suffix on collision, so
-  an existing clean or quarantine item is never overwritten;
+- prefers Linux `renameat2(RENAME_NOREPLACE)` and chooses a suffix on collision;
+  when NFS explicitly reports that flag unsupported, directory publication is
+  serialized and uses the standard same-filesystem rename supported by NFS;
 - copies cross-filesystem content to a hidden exclusive temporary path, securely
   rejects tree changes, verifies the portable tree fingerprint, then atomically
   publishes it;
@@ -83,6 +84,7 @@ does not send Telegram directly.
 | `HELPER_UID`, `HELPER_GID` | `10001` | shared numeric identity for the app, sidecar, and writable host paths |
 | `POLL_SECONDS` | `5` | directory poll interval |
 | `SETTLE_SECONDS` | `30` | unchanged time before scan |
+| `MOVE_FAILURE_RETRY_SECONDS` | `300` | delay before rescanning an unchanged item after promotion or quarantine failure |
 | `MAX_SCAN_WORKERS` | `1` | simultaneous item scans (hard cap: 8) |
 | `DISCOVERY_WORKERS` | `4` | simultaneous fingerprint walks (hard cap: 16) |
 | `DISCOVERY_QUEUE` | `64` | maximum queued fingerprint tasks (hard cap: 4096) |
@@ -111,6 +113,25 @@ policy is a distinct scan-policy failure. The whole top-level item stays in
 `/watch`, a `scan_failed` event with `failure_kind=scan_policy_limit` is emitted,
 and nothing is promoted or quarantined as malware. Filename extensions never
 bypass content validation.
+
+## NFS publication
+
+Cross-filesystem moves are copied to a hidden
+`.web-scan-move-partial-<random-id>` entry inside the target root, verified, and
+then published under the final name. Filesystems supporting
+`RENAME_NOREPLACE` receive the strongest atomic no-overwrite operation. NFS
+servers commonly return `EOPNOTSUPP` (errno 95) for that flag even though they
+support ordinary rename. In that case the service automatically rechecks the
+destination, serializes directory publication between its workers, and uses
+the standard NFS-compatible rename. Existing names are preserved and the next
+available suffix is selected.
+
+The hidden entry may be visible while a cross-filesystem copy is running. It
+should become the final item after verification; the move journal lets restart
+recovery distinguish a published item from an incomplete copy. Run one
+`web-scan-move` application replica for a given `/watch`, `/dest`, `/quarantine`,
+and `/state` set; `MAX_SCAN_WORKERS` provides bounded concurrency inside that
+replica.
 
 Internal paths are `/watch`, `/dest`, `/quarantine`, `/events`, `/state`, and
 `/run/clamav/clamd.sock`. See `.env.example` and

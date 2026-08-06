@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import stat
+import threading
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,6 +18,15 @@ from typing import Iterable
 
 PARTIAL_PREFIX = ".web-scan-move-partial-"
 JOURNAL_SUFFIX = ".json"
+_DIRECTORY_PUBLISH_LOCK = threading.Lock()
+_UNSUPPORTED_NOREPLACE_ERRNOS = frozenset(
+    {
+        errno.ENOSYS,
+        errno.EINVAL,
+        errno.EOPNOTSUPP,
+        errno.ENOTSUP,
+    }
+)
 
 
 class UnsafePathError(RuntimeError):
@@ -153,25 +163,60 @@ def unique_destination(root: Path, source_name: str) -> Path:
     raise RuntimeError(f"unable to allocate a destination name for {source_name}")
 
 
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    """Atomically rename without replacing an existing entry (Linux renameat2)."""
+def _renameat2_noreplace(source: Path, destination: Path) -> None:
+    """Invoke Linux renameat2 with RENAME_NOREPLACE or report it unavailable."""
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is not None:
-        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        renameat2.restype = ctypes.c_int
-        result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
-        if result == 0:
-            return
-        error = ctypes.get_errno()
-        if error not in {errno.ENOSYS, errno.EINVAL}:
-            raise OSError(error, os.strerror(error), str(destination))
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), str(destination))
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), str(destination))
+
+
+def _rename_directory_compatible(source: Path, destination: Path) -> None:
+    """Publish a directory on filesystems lacking RENAME_NOREPLACE, including NFS."""
+    with _DIRECTORY_PUBLISH_LOCK:
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
+
+        try:
+            # This is the standard rename operation used by the original service.
+            # The source and destination are on the same target filesystem here.
+            os.rename(source, destination)
+        except OSError as exc:
+            if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise FileExistsError(
+                    errno.EEXIST,
+                    os.strerror(errno.EEXIST),
+                    str(destination),
+                ) from exc
+            raise
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Rename without replacing content, with an NFS-compatible directory fallback."""
+    try:
+        _renameat2_noreplace(source, destination)
+        return
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_NOREPLACE_ERRNOS:
+            raise
 
     source_info = _safe_lstat(source)
-    if not stat.S_ISREG(source_info.st_mode):
-        raise OSError(errno.ENOTSUP, "atomic no-replace directory rename is unavailable")
-    os.link(source, destination, follow_symlinks=False)
-    source.unlink()
+    if stat.S_ISREG(source_info.st_mode):
+        os.link(source, destination, follow_symlinks=False)
+        source.unlink()
+        return
+    _rename_directory_compatible(source, destination)
 
 
 def _same_entry(path: Path, identity: RootIdentity) -> bool:

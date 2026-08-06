@@ -173,6 +173,55 @@ class SafeTreeTests(unittest.TestCase):
             self.assertEqual((destination_root / "sample.bin").read_bytes(), b"racer")
             self.assertEqual(destination.name, "sample_1.bin")
 
+    def test_nfs_directory_fallback_moves_with_standard_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            destination = base / "destination"
+            source.mkdir()
+            (source / "payload.bin").write_bytes(b"payload")
+
+            with patch.object(
+                safe_move,
+                "_renameat2_noreplace",
+                side_effect=OSError(errno.EOPNOTSUPP, "operation not supported"),
+            ):
+                safe_move._rename_noreplace(source, destination)
+
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / "payload.bin").read_bytes(), b"payload")
+
+    def test_nfs_directory_fallback_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            watch = base / "watch"
+            destination_root = base / "destination"
+            state = base / "state"
+            for directory in (watch, destination_root, state):
+                directory.mkdir()
+            source = watch / "folder"
+            source.mkdir()
+            (source / "new.bin").write_bytes(b"new")
+            existing = destination_root / "folder"
+            existing.mkdir()
+            (existing / "keep.bin").write_bytes(b"keep")
+
+            with patch.object(
+                safe_move,
+                "_renameat2_noreplace",
+                side_effect=OSError(errno.EOPNOTSUPP, "operation not supported"),
+            ):
+                destination = safe_move.move_safely(
+                    source,
+                    destination_root,
+                    expected=safe_move.fingerprint(source),
+                    state_dir=state,
+                )
+
+            self.assertEqual((existing / "keep.bin").read_bytes(), b"keep")
+            self.assertEqual(destination.name, "folder_1")
+            self.assertEqual((destination / "new.bin").read_bytes(), b"new")
+
     def test_cross_filesystem_move_is_recovered_after_publish_crash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -216,6 +265,49 @@ class SafeTreeTests(unittest.TestCase):
                 destination_roots=(destination_root,),
             )
             self.assertEqual(len(recovered), 1)
+            self.assertFalse(source.exists())
+            self.assertEqual((destination_root / "folder" / "payload.bin").read_bytes(), b"payload")
+            self.assertEqual(list(state.glob("*.json")), [])
+
+    def test_cross_filesystem_nfs_fallback_is_recovered_after_publish_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            watch = base / "watch"
+            destination_root = base / "destination"
+            state = base / "state"
+            for directory in (watch, destination_root, state):
+                directory.mkdir()
+            source = watch / "folder"
+            source.mkdir()
+            (source / "payload.bin").write_bytes(b"payload")
+            expected = safe_move.fingerprint(source)
+            original_update = safe_move.MoveJournal.update
+
+            def emulate_mount(current: Path, destination: Path) -> None:
+                if current == source:
+                    raise OSError(errno.EXDEV, "cross-device link")
+                raise OSError(errno.EOPNOTSUPP, "operation not supported")
+
+            def crash_after_publish(journal: safe_move.MoveJournal, phase: str, **values: object) -> None:
+                if phase == "published":
+                    raise RuntimeError("simulated process crash")
+                original_update(journal, phase, **values)
+
+            with (
+                patch.object(safe_move, "_renameat2_noreplace", side_effect=emulate_mount),
+                patch.object(safe_move.MoveJournal, "update", new=crash_after_publish),
+                self.assertRaisesRegex(RuntimeError, "simulated process crash"),
+            ):
+                safe_move.move_safely(source, destination_root, expected=expected, state_dir=state)
+
+            self.assertTrue(source.exists())
+            self.assertEqual(len(list(state.glob("*.json"))), 1)
+            recovered = safe_move.recover_moves(
+                state,
+                watch_root=watch,
+                destination_roots=(destination_root,),
+            )
+            self.assertEqual(recovered, [str(destination_root / "folder")])
             self.assertFalse(source.exists())
             self.assertEqual((destination_root / "folder" / "payload.bin").read_bytes(), b"payload")
             self.assertEqual(list(state.glob("*.json")), [])
@@ -505,6 +597,26 @@ class ProcessorTests(unittest.TestCase):
                 processor.process(source)
             self.assertFalse(source.exists())
             self.assertEqual((destination / "clean.txt").read_text(encoding="utf-8"), "clean")
+
+    def test_move_failure_defers_the_next_scan_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            watch, _, _, _, _, service_patch, event_patch = self._configure(base)
+            source = watch / "clean.txt"
+            source.write_text("clean", encoding="utf-8")
+            with (
+                service_patch,
+                event_patch,
+                patch.object(service, "MOVE_FAILURE_RETRY_SECONDS", 300),
+                patch.object(service, "move_safely", side_effect=OSError("NFS unavailable")),
+            ):
+                processor = service.ItemProcessor(service.RecoveryTracker())
+                processor._clamd = FakeClamd()
+                self.assertTrue(processor.reserve(source))
+                processor.process(source)
+                self.assertFalse(processor.reserve(source))
+
+            self.assertTrue(source.exists())
 
     def test_infected_folder_goes_to_non_overwriting_quarantine_and_emits_events(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

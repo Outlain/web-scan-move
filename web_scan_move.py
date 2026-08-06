@@ -36,6 +36,10 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
 CLAMD_SOCKET = os.environ.get("CLAMD_SOCKET", "/run/clamav/clamd.sock")
 POLL_SECONDS = max(float(os.environ.get("POLL_SECONDS", "5")), 1.0)
 SETTLE_SECONDS = max(float(os.environ.get("SETTLE_SECONDS", "30")), 5.0)
+MOVE_FAILURE_RETRY_SECONDS = max(
+    float(os.environ.get("MOVE_FAILURE_RETRY_SECONDS", "300")),
+    5.0,
+)
 MAX_WORKERS = min(max(int(os.environ.get("MAX_SCAN_WORKERS", "1")), 1), 8)
 DISCOVERY_WORKERS = min(max(int(os.environ.get("DISCOVERY_WORKERS", "4")), 2), 16)
 DISCOVERY_QUEUE = min(
@@ -220,6 +224,7 @@ class ItemProcessor:
     def __init__(self, tracker: RecoveryTracker) -> None:
         self._lock = threading.Lock()
         self._active: set[str] = set()
+        self._retry_after: dict[str, float] = {}
         self._tracker = tracker
         self._clamd = ClamdClient(
             CLAMD_SOCKET,
@@ -238,8 +243,17 @@ class ItemProcessor:
         with self._lock:
             if key in self._active:
                 return False
+            retry_after = self._retry_after.get(key)
+            if retry_after is not None:
+                if time.monotonic() < retry_after:
+                    return False
+                self._retry_after.pop(key, None)
             self._active.add(key)
             return True
+
+    def defer_move_retry(self, path: Path) -> None:
+        with self._lock:
+            self._retry_after[self.key(path)] = time.monotonic() + MOVE_FAILURE_RETRY_SECONDS
 
     def is_active(self, path: Path) -> bool:
         with self._lock:
@@ -371,7 +385,14 @@ class ItemProcessor:
         except Exception as exc:
             event_type = "quarantine_failed" if infected else "promotion_failed"
             severity = "critical" if infected else "warning"
-            log(event_type, path=path, target_root=target_root, error=str(exc))
+            self.defer_move_retry(path)
+            log(
+                event_type,
+                path=path,
+                target_root=target_root,
+                error=str(exc),
+                retry_seconds=MOVE_FAILURE_RETRY_SECONDS,
+            )
             _emit_failure(
                 self._tracker,
                 event_type,
