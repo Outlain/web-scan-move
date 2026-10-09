@@ -273,6 +273,9 @@ class ItemProcessor:
         try:
             mounts = capture_mounts()
             before = fingerprint(path, incomplete_suffixes=TEMP_SUFFIXES)
+            if before.files == 0:
+                log("not_ready", path=path, reason="item contains no regular files")
+                return
             clamd_identity = self._clamd.health()
         except (OSError, RuntimeError, UnsafePathError, ClamdError) as exc:
             log("scan_precondition_failed", path=path, error=str(exc))

@@ -226,7 +226,67 @@ def _same_entry(path: Path, identity: RootIdentity) -> bool:
         return False
 
 
-def _copy_regular(source: Path, destination: Path) -> None:
+def _content_record(relative: str, info: os.stat_result, file_digest: bytes = b"") -> bytes:
+    """Describe content and layout without filesystem-specific permissions/times."""
+    encoded = os.fsencode(relative)
+    record = (
+        len(encoded).to_bytes(8, "big")
+        + encoded
+        + stat.S_IFMT(info.st_mode).to_bytes(8, "big")
+    )
+    if stat.S_ISREG(info.st_mode):
+        record += info.st_size.to_bytes(16, "big", signed=False) + file_digest
+    return record
+
+
+def _regular_content_digest(path: Path, expected: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        identity = RootIdentity.from_stat(opened)
+        if not stat.S_ISREG(opened.st_mode) or identity != RootIdentity.from_stat(expected):
+            raise UnsafePathError(f"copied file was replaced before verification: {path}")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            RootIdentity.from_stat(after) != identity
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+            or not _same_entry(path, identity)
+        ):
+            raise UnsafePathError(f"copied file changed during verification: {path}")
+        return digest.digest()
+    finally:
+        os.close(descriptor)
+
+
+def _copied_content_digest(root: Path) -> str:
+    before = fingerprint(root)
+    root_info = _safe_lstat(root)
+    digest = hashlib.sha256()
+    if stat.S_ISDIR(root_info.st_mode):
+        digest.update(_content_record(".", root_info))
+    for relative, info in iter_tree(root):
+        file_digest = b""
+        if stat.S_ISREG(info.st_mode):
+            path = root if relative == "." else root / relative
+            file_digest = _regular_content_digest(path, info)
+        digest.update(_content_record(relative, info, file_digest))
+    if fingerprint(root) != before:
+        raise UnsafePathError("copied tree changed during verification")
+    return digest.hexdigest()
+
+
+def _copy_regular(source: Path, destination: Path) -> bytes:
     source_flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         source_flags |= os.O_NOFOLLOW
@@ -244,11 +304,13 @@ def _copy_regular(source: Path, destination: Path) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
             stat.S_IMODE(opened.st_mode),
         )
+        digest = hashlib.sha256()
         try:
             while True:
                 chunk = os.read(source_descriptor, 1024 * 1024)
                 if not chunk:
                     break
+                digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
                     written = os.write(destination_descriptor, view)
@@ -262,12 +324,15 @@ def _copy_regular(source: Path, destination: Path) -> None:
             raise UnsafePathError(f"copy source identity changed: {source}")
         if not _same_entry(source, opened_identity):
             raise UnsafePathError(f"copy source path was replaced: {source}")
+        return digest.digest()
     finally:
         os.close(source_descriptor)
 
 
-def _copy_directory(source: Path, temporary: Path) -> None:
+def _copy_directory(source: Path, temporary: Path) -> str:
     source_root = _safe_lstat(source)
+    digest = hashlib.sha256()
+    digest.update(_content_record(".", source_root))
     temporary.mkdir(mode=stat.S_IMODE(source_root.st_mode))
     copied_directories: list[tuple[Path, Path]] = [(source, temporary)]
     for current_root, directory_names, file_names in os.walk(source, followlinks=False):
@@ -284,21 +349,24 @@ def _copy_directory(source: Path, temporary: Path) -> None:
             target_child = target_current / directory_name
             target_child.mkdir(mode=stat.S_IMODE(child_info.st_mode))
             copied_directories.append((child, target_child))
+            digest.update(_content_record(child.relative_to(source).as_posix() + "/", child_info))
         for file_name in file_names:
             child = current / file_name
-            _safe_lstat(child)
-            _copy_regular(child, target_current / file_name)
+            child_info = _safe_lstat(child)
+            file_digest = _copy_regular(child, target_current / file_name)
+            digest.update(_content_record(child.relative_to(source).as_posix(), child_info, file_digest))
     for original, copied in reversed(copied_directories):
         _safe_lstat(original)
         shutil.copystat(original, copied, follow_symlinks=False)
+    return digest.hexdigest()
 
 
-def _copy_to_temporary(source: Path, temporary: Path) -> None:
+def _copy_to_temporary(source: Path, temporary: Path) -> str:
     source_info = _safe_lstat(source)
     if stat.S_ISDIR(source_info.st_mode):
-        _copy_directory(source, temporary)
-    else:
-        _copy_regular(source, temporary)
+        return _copy_directory(source, temporary)
+    file_digest = _copy_regular(source, temporary)
+    return hashlib.sha256(_content_record(".", source_info, file_digest)).hexdigest()
 
 
 def _remove_owned_path(path: Path) -> None:
@@ -456,11 +524,12 @@ def move_safely(
     )
     published = False
     try:
-        _copy_to_temporary(source, temporary)
+        copied_source_digest = _copy_to_temporary(source, temporary)
         if fingerprint(source, incomplete_suffixes=incomplete_suffixes) != expected:
             raise RuntimeError("source changed while it was being copied")
-        copied = fingerprint(temporary)
-        if copied.portable_digest != expected.portable_digest:
+        # Preserve strict source fingerprints and the existing journal format,
+        # but compare copied bytes/layout independently of NAS metadata changes.
+        if _copied_content_digest(temporary) != copied_source_digest:
             raise RuntimeError("copied content does not match the scanned source")
         temporary_identity = RootIdentity.from_stat(_safe_lstat(temporary))
         journal.update("ready", temporary_identity=asdict(temporary_identity))

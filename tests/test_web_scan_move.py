@@ -313,6 +313,147 @@ class SafeTreeTests(unittest.TestCase):
             self.assertEqual(list(state.glob("*.json")), [])
 
 
+class CrossFilesystemCopyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.watch = self.base / "watch"
+        self.destination = self.base / "destination"
+        self.state = self.base / "state"
+        for directory in (self.watch, self.destination, self.state):
+            directory.mkdir()
+
+    def _move(self, source: Path) -> Path:
+        original_rename = safe_move._rename_noreplace
+
+        def cross_device(current: Path, destination: Path) -> None:
+            if current == source:
+                raise OSError(errno.EXDEV, "cross-device link")
+            original_rename(current, destination)
+
+        with patch.object(safe_move, "_rename_noreplace", side_effect=cross_device):
+            return safe_move.move_safely(
+                source,
+                self.destination,
+                expected=safe_move.fingerprint(source),
+                state_dir=self.state,
+            )
+
+    def _assert_failed_copy_is_retained(self, source: Path) -> None:
+        self.assertTrue(source.exists())
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_nas_metadata_changes_do_not_reject_matching_content(self) -> None:
+        original_copy = safe_move._copy_to_temporary
+
+        def normalize_metadata(source: Path, copied: Path):
+            result = original_copy(source, copied)
+            entries = [copied, *copied.rglob("*")] if copied.is_dir() else [copied]
+            for entry in entries:
+                info = entry.stat()
+                entry.chmod(0o750 if entry.is_dir() else 0o640)
+                rounded = info.st_mtime_ns // 1_000_000_000 * 1_000_000_000
+                os.utime(entry, ns=(info.st_atime_ns, rounded))
+            return result
+
+        for is_directory in (False, True):
+            with self.subTest(is_directory=is_directory):
+                source = self.watch / ("folder" if is_directory else "file.bin")
+                if is_directory:
+                    source.mkdir()
+                    (source / "nested").mkdir()
+                    (source / "empty").mkdir()
+                    payload = source / "nested" / "payload\n.bin"
+                else:
+                    payload = source
+                payload.write_bytes(b"downloaded content")
+                payload.chmod(0o600)
+                os.utime(payload, ns=(1_700_000_000_123_456_789,) * 2)
+
+                with patch.object(safe_move, "_copy_to_temporary", side_effect=normalize_metadata):
+                    destination = self._move(source)
+
+                copied_payload = destination / "nested" / payload.name if is_directory else destination
+                self.assertFalse(source.exists())
+                self.assertEqual(copied_payload.read_bytes(), b"downloaded content")
+                self.assertEqual(stat.S_IMODE(copied_payload.stat().st_mode), 0o640)
+                if is_directory:
+                    self.assertTrue((destination / "empty").is_dir())
+                self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_same_size_corruption_is_rejected_even_with_matching_metadata(self) -> None:
+        source = self.watch / "payload.bin"
+        source.write_bytes(b"safe content")
+        original_copy = safe_move._copy_to_temporary
+
+        def corrupt_copy(original: Path, copied: Path):
+            result = original_copy(original, copied)
+            info = copied.stat()
+            copied.write_bytes(b"evil content")
+            os.utime(copied, ns=(info.st_atime_ns, info.st_mtime_ns))
+            return result
+
+        with (
+            patch.object(safe_move, "_copy_to_temporary", side_effect=corrupt_copy),
+            self.assertRaisesRegex(RuntimeError, "copied content does not match"),
+        ):
+            self._move(source)
+
+        self.assertEqual(source.read_bytes(), b"safe content")
+        self._assert_failed_copy_is_retained(source)
+
+    def test_source_changes_during_copy_are_still_rejected(self) -> None:
+        source = self.watch / "payload.bin"
+        source.write_bytes(b"safe content")
+        original_copy = safe_move._copy_to_temporary
+
+        def change_source(original: Path, copied: Path):
+            result = original_copy(original, copied)
+            original.write_bytes(b"new unscanned content")
+            return result
+
+        with (
+            patch.object(safe_move, "_copy_to_temporary", side_effect=change_source),
+            self.assertRaisesRegex(RuntimeError, "source changed while"),
+        ):
+            self._move(source)
+
+        self.assertEqual(source.read_bytes(), b"new unscanned content")
+        self._assert_failed_copy_is_retained(source)
+
+    def test_copy_tree_changes_are_rejected(self) -> None:
+        original_copy = safe_move._copy_to_temporary
+        for change in ("rename", "missing", "extra", "symlink"):
+            with self.subTest(change=change):
+                source = self.watch / change
+                source.mkdir()
+                (source / "payload.bin").write_bytes(b"safe content")
+                (source / "empty").mkdir()
+
+                def change_tree(original: Path, copied: Path):
+                    result = original_copy(original, copied)
+                    if change == "rename":
+                        (copied / "payload.bin").rename(copied / "other.bin")
+                    elif change == "missing":
+                        (copied / "empty").rmdir()
+                    elif change == "extra":
+                        (copied / "extra").mkdir()
+                    else:
+                        (copied / "payload.bin").unlink()
+                        (copied / "payload.bin").symlink_to(original / "payload.bin")
+                    return result
+
+                with (
+                    patch.object(safe_move, "_copy_to_temporary", side_effect=change_tree),
+                    self.assertRaises((RuntimeError, safe_move.UnsafePathError)),
+                ):
+                    self._move(source)
+
+                self._assert_failed_copy_is_retained(source)
+
+
 class HealthTests(unittest.TestCase):
     def test_mount_marker_traversal_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -597,6 +738,39 @@ class ProcessorTests(unittest.TestCase):
                 processor.process(source)
             self.assertFalse(source.exists())
             self.assertEqual((destination / "clean.txt").read_text(encoding="utf-8"), "clean")
+
+    def test_empty_download_directories_are_left_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            watch, destination, _, events, _, service_patch, event_patch = self._configure(base)
+            with service_patch, event_patch:
+                processor = service.ItemProcessor(service.RecoveryTracker())
+                processor._clamd = FakeClamd()
+                for name in ("incomplete", "complete"):
+                    source = watch / name
+                    source.mkdir()
+                    (source / "empty-child").mkdir()
+                    self.assertTrue(processor.reserve(source))
+                    processor.process(source)
+                    self.assertTrue(source.is_dir())
+
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(list(events.iterdir()), [])
+
+    def test_zero_byte_download_is_still_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            watch, destination, _, _, _, service_patch, event_patch = self._configure(base)
+            source = watch / "empty.txt"
+            source.touch()
+            with service_patch, event_patch:
+                processor = service.ItemProcessor(service.RecoveryTracker())
+                processor._clamd = FakeClamd()
+                self.assertTrue(processor.reserve(source))
+                processor.process(source)
+
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / source.name).read_bytes(), b"")
 
     def test_move_failure_defers_the_next_scan_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

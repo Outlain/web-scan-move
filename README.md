@@ -45,12 +45,15 @@ The service:
   when NFS explicitly reports that flag unsupported, directory publication is
   serialized and uses the standard same-filesystem rename supported by NFS;
 - copies cross-filesystem content to a hidden exclusive temporary path, securely
-  rejects tree changes, verifies the portable tree fingerprint, then atomically
-  publishes it;
+  rejects source changes, and verifies the copied tree layout, file sizes, and
+  SHA-256 checksums before atomically publishing it;
 - journals cross-filesystem publication under `/state`, allowing a restart to
   remove an unpublished partial or finish deletion only when inode ownership
   proves that the completed destination belongs to that move;
-- leaves scan and promotion failures in `/watch` for retry.
+- leaves scan and promotion failures in `/watch` for retry;
+- leaves folders containing no regular files in place instead of promoting empty
+  download directories such as `complete` and `incomplete`. Zero-byte files are
+  still scanned and moved.
 
 Files at or below `MAX_STREAM_MIB` keep the normal native ClamD path. Larger
 files are never skipped. Genuine video containers are verified by `ffprobe`,
@@ -125,6 +128,15 @@ support ordinary rename. In that case the service automatically rechecks the
 destination, serializes directory publication between its workers, and uses
 the standard NFS-compatible rename. Existing names are preserved and the next
 available suffix is selected.
+
+Copy verification checks every file's bytes against the SHA-256 checksum collected
+while copying the scanned source, along with names, types, sizes, and empty
+subdirectories. It does not require destination permissions or nanosecond
+timestamps to equal the source: NAS ACLs and timestamp precision can legitimately
+change that metadata. Source identity, permissions, size, mtime, and ctime checks
+remain strict so changes to an item after scanning still prevent its deletion.
+The existing move-journal format is unchanged. Verification adds one full read of
+the temporary destination; the source is hashed during its existing copy read.
 
 The hidden entry may be visible while a cross-filesystem copy is running. It
 should become the final item after verification; the move journal lets restart
