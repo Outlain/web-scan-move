@@ -1,6 +1,6 @@
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
-ARG PYTHON_PACKAGE_VERSION=3.14.5-r0
+ARG PYTHON_PACKAGE_VERSION=3.14.8-r0
 
 RUN apk upgrade --no-cache \
     && apk add --no-cache "python3=${PYTHON_PACKAGE_VERSION}" ffmpeg \
